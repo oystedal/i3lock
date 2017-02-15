@@ -22,7 +22,7 @@
 #include "unlock_indicator.h"
 #include "xinerama.h"
 
-#define BUTTON_RADIUS 90
+#define BUTTON_RADIUS 200
 #define BUTTON_SPACE (BUTTON_RADIUS + 5)
 #define BUTTON_CENTER (BUTTON_RADIUS + 5)
 #define BUTTON_DIAMETER (2 * BUTTON_SPACE)
@@ -34,10 +34,12 @@
  ******************************************************************************/
 static struct ev_periodic *time_redraw_tick;
 
+extern struct ev_loop *main_loop;
+
 extern bool debug_mode;
 
 /* The current position in the input buffer. Useful to determine if any
- * characters of the password have already been entered or not. 
+ * characters of the password have already been entered or not.
  */
 int input_position;
 
@@ -95,10 +97,48 @@ extern xcb_screen_t *screen;
 static xcb_visualtype_t *vistype;
 
 /* Maintain the current unlock/PAM state to draw the appropriate unlock
- * indicator. 
+ * indicator.
  */
 unlock_state_t unlock_state;
 pam_state_t pam_state;
+
+// ev_tstamp is a double
+static ev_tstamp last_key_event = 0.0;
+static int current_random_int = -1;
+
+void update_last_key_event(struct ev_loop* loop) {
+    ev_now_update(loop);
+    DEBUG("last_key_event=%.2f\n", last_key_event);
+    last_key_event = ev_now(loop);
+}
+
+#define ATTACK_TIME 0.5
+#define SUSTAIN_TIME 1.0
+#define INITIAL_ALPHA 0.8
+#define RELEASE_TIME 0.5
+#define FINAL_ALPHA 0.0
+
+static double g_alpha = 1.0;
+
+static void compute_alpha(struct ev_loop* loop) {
+    const ev_tstamp dt = ev_now(loop) - last_key_event;
+
+    if (pam_state == STATE_PAM_VERIFY || pam_state == STATE_PAM_WRONG) {
+        update_last_key_event(loop);
+        g_alpha = 1.0;
+        return;
+    }
+
+    if (dt <= SUSTAIN_TIME) {
+        g_alpha = INITIAL_ALPHA;
+    } else if (dt >= SUSTAIN_TIME + RELEASE_TIME) {
+        g_alpha = 0.0;
+    } else {
+        g_alpha = INITIAL_ALPHA * (1.0 - ((dt - SUSTAIN_TIME) / RELEASE_TIME));
+    }
+
+    DEBUG("dt=%.2f alpha=%.2f\n", dt, g_alpha);
+}
 
 /*
  * Returns the scaling factor of the current screen. E.g., on a 227 DPI MacBook
@@ -123,10 +163,10 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
     if (!vistype)
         vistype = get_root_visual_type(screen);
     bg_pixmap = create_bg_pixmap(conn, screen, resolution, color);
-    /* 
+    /*
      * Initialize cairo: Create one in-memory surface to render the unlock
      * indicator on, create one XCB surface to actually draw (one or more,
-     * depending on the amount of screens) unlock indicators on. 
+     * depending on the amount of screens) unlock indicators on.
      */
     cairo_surface_t *output = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, button_diameter_physical, button_diameter_physical);
     cairo_t *ctx = cairo_create(output);
@@ -160,15 +200,20 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
             case 'b': /* Background */
                 cairo_set_source_rgb(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0);
                 break;
-            case 'l': /* Line and text */
+            case 't':
+                // cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.8);
                 cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.8);
+                break;
+            case 'l': /* Line and text */
+                // cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.8);
+                cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, g_alpha);
                 break;
             case 'f': /* Fill */
                 /* Use a lighter tint of the user defined color for circle fill */
                 for (int i=0; i < 3; i++) {
                     rgb16[i] = ((255 - rgb16[i]) * .5) + rgb16[i];
                 }
-                cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.2);
+                cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, g_alpha);
                 break;
         }
         free(rgb16);
@@ -206,7 +251,7 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
                   2 * M_PI /* end */);
 
         /* Use the appropriate color for the different PAM states
-         * (currently verifying, wrong password, or idle) 
+         * (currently verifying, wrong password, or idle)
          */
 
         void set_pam_color(char colortype) {
@@ -227,14 +272,14 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
                         set_color(ctx,wrongcolor,colortype);
                     }
                     else {
-                        set_color(ctx,idlecolor,colortype);  
+                        set_color(ctx,idlecolor,colortype);
                     }
                     break;
             }
         }
 
         set_pam_color('f');
-        cairo_fill_preserve(ctx);
+        // cairo_fill_preserve(ctx);
 
         /* Circle border */
         set_pam_color('l');
@@ -251,8 +296,8 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
             strftime(timetext, 100, TIME_FORMAT_12, tm);
 
         /* Text */
-        set_pam_color('l');
-        cairo_set_font_size(ctx, 32.0);
+        set_pam_color('t');
+        cairo_set_font_size(ctx, 96.0);
 
         cairo_text_extents_t time_extents;
         double time_x, time_y;
@@ -266,6 +311,8 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
         cairo_close_path(ctx);
 
         free(timetext);
+
+        set_pam_color('l');
 
         if (pam_state == STATE_PAM_WRONG && (modifier_string != NULL)) {
             cairo_text_extents_t extents;
@@ -282,11 +329,69 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
             cairo_close_path(ctx);
         }
 
+#if 1
+        if (unlock_state == STATE_KEY_ACTIVE ||
+            unlock_state == STATE_BACKSPACE_ACTIVE) {
+            // update the current random int
+            // do part of the circle calculation here, this way we can
+            // handle the initial case of a complete circle
+            current_random_int = rand() % (int)(2 * M_PI * 100);
+        }
+
+        if (pam_state == STATE_PAM_VERIFY || pam_state == STATE_PAM_WRONG) {
+            current_random_int = -1;
+        } else if ((unlock_state == STATE_KEY_ACTIVE ||
+             unlock_state == STATE_KEY_PRESSED ||
+             unlock_state == STATE_BACKSPACE_ACTIVE
+            )
+                && current_random_int != -1) {
+            cairo_set_line_width(ctx, 4);
+            cairo_new_sub_path(ctx);
+            double highlight_start = current_random_int / 100.0;
+            cairo_arc(ctx,
+                    BUTTON_CENTER /* x */,
+                    BUTTON_CENTER /* y */,
+                    BUTTON_RADIUS /* radius */,
+                    highlight_start,
+                    highlight_start + (M_PI / 2.5));
+
+            /* Set newly drawn lines to erase what they're drawn over */
+            cairo_set_operator(ctx,CAIRO_OPERATOR_CLEAR);
+            cairo_stroke(ctx);
+
+            /* Back to normal operator */
+            cairo_set_operator(ctx,CAIRO_OPERATOR_OVER);
+            cairo_set_line_width(ctx, 10);
+
+            /* Change color of separators based on backspace/active keypress */
+            set_pam_color('l');
+
+            /* Separator 1 */
+            cairo_arc(ctx,
+                    BUTTON_CENTER /* x */,
+                    BUTTON_CENTER /* y */,
+                    BUTTON_RADIUS /* radius */,
+                    highlight_start /* start */,
+                    highlight_start + (M_PI / 128.0) /* end */);
+            cairo_stroke(ctx);
+
+            /* Separator 2 */
+            cairo_arc(ctx,
+                    BUTTON_CENTER /* x */,
+                    BUTTON_CENTER /* y */,
+                    BUTTON_RADIUS /* radius */,
+                    highlight_start + (M_PI / 2.5) /* start */,
+                    (highlight_start + (M_PI / 2.5)) + (M_PI / 128.0) /* end */);
+            cairo_stroke(ctx);
+        }
+
+#else
         /* After the user pressed any valid key or the backspace key, we
          * highlight a random part of the unlock indicator to confirm this
          * keypress. */
         if (unlock_state == STATE_KEY_ACTIVE ||
             unlock_state == STATE_BACKSPACE_ACTIVE) {
+            DEBUG("KEY_ACTIVE\n");
             cairo_set_line_width(ctx, 4);
             cairo_new_sub_path(ctx);
             double highlight_start = (rand() % (int)(2 * M_PI * 100)) / 100.0;
@@ -295,14 +400,14 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
                       BUTTON_CENTER /* y */,
                       BUTTON_RADIUS /* radius */,
                       highlight_start,
-                      highlight_start + (M_PI / 2.5)); 
+                      highlight_start + (M_PI / 2.5));
 
             /* Set newly drawn lines to erase what they're drawn over */
-            cairo_set_operator(ctx,CAIRO_OPERATOR_CLEAR); 
+            cairo_set_operator(ctx,CAIRO_OPERATOR_CLEAR);
             cairo_stroke(ctx);
 
             /* Back to normal operator */
-            cairo_set_operator(ctx,CAIRO_OPERATOR_OVER); 
+            cairo_set_operator(ctx,CAIRO_OPERATOR_OVER);
             cairo_set_line_width(ctx, 10);
 
             /* Change color of separators based on backspace/active keypress */
@@ -326,6 +431,7 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
                 (highlight_start + (M_PI / 2.5)) + (M_PI / 128.0) /* end */);
             cairo_stroke(ctx);
         }
+#endif
     }
 
     if (xr_screens > 0) {
@@ -363,6 +469,15 @@ void redraw_screen(void) {
     /* XXX: Possible optimization: Only update the area in the middle of the
      * screen instead of the whole screen. */
     xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
+
+    /*
+    const int x0 = (last_resolution[0] / 2) - 100;
+    const int x1 = (last_resolution[0] / 2) + 100;
+    const int y0 = (last_resolution[1] / 2) - 100;
+    const int y1 = (last_resolution[1] / 2) + 100;
+    xcb_clear_area(conn, 0, win, x0, y0, x1, y1);
+    */
+
     xcb_free_pixmap(conn, bg_pixmap);
     xcb_flush(conn);
 }
@@ -371,25 +486,28 @@ void redraw_screen(void) {
 
 void clear_indicator(void) {
     unlock_state = STATE_KEY_PRESSED;
+    last_key_event = 0.0;
     redraw_screen();
 }
 
 /* Periodic redraw for clock updates - taken from github.com/ravinrabbid/i3lock-clock */
 
 static void time_redraw_cb(struct ev_loop *loop, ev_periodic *w, int revents) {
+    compute_alpha(loop);
     redraw_screen();
 }
 
 void start_time_redraw_tick(struct ev_loop* main_loop) {
+#define PERIOD 0.001
     if (time_redraw_tick) {
-        ev_periodic_set(time_redraw_tick, 1.0, 60., 0);
+        ev_periodic_set(time_redraw_tick, 0.00, PERIOD, 0);
         ev_periodic_again(main_loop, time_redraw_tick);
     } else {
         /* When there is no memory, we just don’t have a timeout. We cannot
         * exit() here, since that would effectively unlock the screen. */
         if (!(time_redraw_tick = calloc(sizeof(struct ev_periodic), 1)))
         return;
-        ev_periodic_init(time_redraw_tick,time_redraw_cb, 1.0, 60., 0);
+        ev_periodic_init(time_redraw_tick,time_redraw_cb, 0.00, PERIOD, 0);
         ev_periodic_start(main_loop, time_redraw_tick);
     }
 }

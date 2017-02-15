@@ -45,6 +45,8 @@
 typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
 static void input_done(void);
 
+void update_last_key_event(struct ev_loop* loop);
+
 /* We need this for libxkbfile */
 
 /* Color options */
@@ -365,6 +367,8 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     int n;
     bool ctrl;
     bool composed = false;
+
+    update_last_key_event(main_loop);
 
     ksym = xkb_state_key_get_one_sym(xkb_state, event->detail);
     ctrl = xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_DEPRESSED);
@@ -1066,6 +1070,8 @@ int main(int argc, char *argv[]) {
      * received up until now. ev will only pick up new events (when the X11
      * file descriptor becomes readable). */
     ev_invoke(main_loop, xcb_check, 0);
+
+    update_last_key_event(main_loop);
 
     start_time_redraw_tick(main_loop);
 
